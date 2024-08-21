@@ -1,9 +1,4 @@
-use crate::{
-    color_names::TurtleColor,
-    polygon::{TurtlePolygon, TurtleShapeName},
-    speed::TurtleSpeed,
-    Turtle,
-};
+use crate::{color_names::TurtleColor, polygon::TurtleShapeName, speed::TurtleSpeed, Turtle};
 
 //
 // A DrawRequest is something that the turtle thread asks us to put on the screen.
@@ -42,7 +37,6 @@ pub enum RotateCmd {
 
 #[derive(Clone, Debug)]
 pub enum InstantaneousDrawCmd {
-    BackfillPolygon,
     PenDown,
     PenUp,
     PenColor(TurtleColor),
@@ -50,8 +44,11 @@ pub enum InstantaneousDrawCmd {
     PenWidth(f32),
     Dot(Option<f32>, TurtleColor),
     Stamp,
-    Fill(TurtlePolygon),
     Tracer(bool),
+    BeginFill,
+    EndFill,
+    BeginPoly,
+    EndPoly,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -60,10 +57,6 @@ pub enum ScreenCmd {
     Background(TurtleColor),
     ClearStamp(usize),
     ClearStamps(isize),
-    BeginFill,
-    EndFill,
-    BeginPoly,
-    EndPoly,
     Speed(TurtleSpeed),
     ShowTurtle(bool),
     SetSize([isize; 2]),

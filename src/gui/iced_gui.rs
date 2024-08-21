@@ -239,6 +239,7 @@ pub(crate) struct IcedGuiFramework {
     bgcolor: TurtleColor,
     tt: TurtleTask,
     gui: IcedGuiInternal,
+    clear_cache: bool,
 }
 
 #[derive(Default)]
@@ -247,13 +248,13 @@ struct IcedGuiInternal {
     turtle: HashMap<TurtleID, IndividualTurtle>,
     popups: HashMap<WindowID, PopupData>,
     wcmds: Vec<IcedCommand<Message>>,
+    newbgcolor: Option<TurtleColor>,
 }
 
 impl TurtleGui for IcedGuiInternal {
     fn new_turtle(&mut self) -> TurtleID {
         let id = self.last_id.get();
 
-        println!("creating turtle ID {id:?}");
         self.turtle.insert(id, IndividualTurtle::default());
         id
     }
@@ -290,10 +291,9 @@ impl TurtleGui for IcedGuiInternal {
     }
 
     fn fill_polygon(&mut self, turtle_id: TurtleID, cmd: DrawCommand, index: usize) {
-        self.turtle
-            .get_mut(&turtle_id)
-            .expect("missing turtle")
-            .cmds[index] = cmd;
+        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
+        turtle.has_new_cmd = true;
+        turtle.cmds[index] = cmd;
     }
 
     fn undo_count(&self, turtle_id: TurtleID) -> usize {
@@ -317,6 +317,10 @@ impl TurtleGui for IcedGuiInternal {
     fn textinput(&mut self, turtle: TurtleID, thread: TurtleThread, title: &str, prompt: &str) {
         self.generate_popup(PopupData::text_input(title, prompt, turtle, thread));
     }
+
+    fn bgcolor(&mut self, color: TurtleColor) {
+        self.newbgcolor = Some(color);
+    }
 }
 
 impl Application for IcedGuiFramework {
@@ -332,14 +336,14 @@ impl Application for IcedGuiFramework {
         let mut tt = TurtleTask::new(&mut flags);
         tt.run_turtle(func.unwrap());
 
-        let mut framework = Self {
+        let framework = Self {
             cache: Cache::default(),
             bgcolor: TurtleColor::from("white"),
             tt,
+            clear_cache: true,
             gui: IcedGuiInternal::new(WindowID::MAIN, PopupData::mainwin(&title)),
         };
-        let turtle_id = framework.gui.new_turtle();
-        assert_eq!(*turtle_id, 0);
+
         (framework, IcedCommand::none())
     }
 
@@ -354,8 +358,14 @@ impl Application for IcedGuiFramework {
     fn update(&mut self, message: Self::Message) -> iced::Command<Self::Message> {
         match message {
             Message::Tick => {
+                if self.clear_cache {
+                    self.cache.clear();
+                    self.clear_cache = false;
+                }
                 self.tt.tick(&mut self.gui);
-                self.convert_to_iced();
+                if self.update_turtles() {
+                    self.clear_cache = true;
+                }
             }
             Message::AckError(id) => {
                 let popup = self.gui.popups.get_mut(&id).expect("looking up popup data");
@@ -516,7 +526,12 @@ impl IcedGuiFramework {
         .expect("failed to start turtle");
     }
 
-    fn convert_to_iced(&mut self) {
+    // returns true if the cache should be cleared
+    fn update_turtles(&mut self) -> bool {
+        if let Some(color) = self.gui.newbgcolor.take() {
+            self.bgcolor = color;
+        }
+
         let mut done = true;
 
         for (tid, turtle) in self.gui.turtle.iter_mut() {
@@ -531,18 +546,18 @@ impl IcedGuiFramework {
             }
         }
 
-        if !done {
-            self.cache.clear();
-        }
+        !done
     }
 }
 
 impl IcedGuiInternal {
     fn new(window_id: WindowID, popup_data: PopupData) -> Self {
-        Self {
+        let mut this = Self {
             popups: HashMap::from([(window_id, popup_data)]),
             ..Self::default()
-        }
+        };
+        let _turtle = this.new_turtle();
+        this
     }
 
     fn generate_popup(&mut self, popupdata: PopupData) {
