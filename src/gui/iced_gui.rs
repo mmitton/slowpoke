@@ -13,12 +13,13 @@ use iced::{
     Color, Element, Event, Length, Point, Rectangle, Renderer, Settings, Size, Subscription, Theme,
 };
 
-use iced::keyboard::{Event::KeyPressed, Key};
+use iced::keyboard::{Event::KeyPressed, Event::KeyReleased, Key};
 use iced::window::Event::Resized;
 
+use either::Either;
 use lyon_tessellation::geom::{euclid::default::Transform2D, Angle};
 
-use super::events::TurtleEvent;
+use super::{events::TurtleEvent, StampCount};
 use crate::{
     color_names::TurtleColor,
     generate::DrawCommand,
@@ -205,8 +206,12 @@ impl IndividualTurtle {
                             .push(IcedDrawCmd::Stroke(path, pencolor, penwidth));
                     }
                 }
-                DrawCommand::Filler => {}
-                _ => panic!("{element:?} not yet implemeted"),
+                DrawCommand::Filler | DrawCommand::Filled(_) => {}
+                DrawCommand::StampTurtle
+                | DrawCommand::BeginFill
+                | DrawCommand::EndFill
+                | DrawCommand::BeginPoly
+                | DrawCommand::EndPoly => panic!("invalid draw command in gui"),
             }
         }
 
@@ -236,10 +241,12 @@ type IcedCommand<T> = iced::Command<T>;
 #[derive(Default)]
 pub(crate) struct IcedGuiFramework {
     cache: Cache,
-    bgcolor: TurtleColor,
     tt: TurtleTask,
     gui: IcedGuiInternal,
     clear_cache: bool,
+    winsize: (f32, f32),   // width, height
+    mouse_pos: (f32, f32), // x, y
+    mouse_down: bool,
 }
 
 #[derive(Default)]
@@ -248,7 +255,8 @@ struct IcedGuiInternal {
     turtle: HashMap<TurtleID, IndividualTurtle>,
     popups: HashMap<WindowID, PopupData>,
     wcmds: Vec<IcedCommand<Message>>,
-    newbgcolor: Option<TurtleColor>,
+    bgcolor: TurtleColor,
+    resize_request: Option<(TurtleID, TurtleThread)>,
 }
 
 impl TurtleGui for IcedGuiInternal {
@@ -259,55 +267,96 @@ impl TurtleGui for IcedGuiInternal {
         id
     }
 
-    fn set_shape(&mut self, turtle_id: TurtleID, shape: TurtleShape) {
+    fn set_shape(&mut self, turtle: TurtleID, shape: TurtleShape) {
         self.turtle
-            .get_mut(&turtle_id)
+            .get_mut(&turtle)
             .expect("missing turtle")
             .turtle_shape = shape;
     }
 
-    fn stamp(&mut self, turtle_id: TurtleID, pos: ScreenPosition<f32>, angle: f32) {
-        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
+    fn stamp(&mut self, turtle: TurtleID, pos: ScreenPosition<f32>, angle: f32) -> usize {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
         turtle.cmds.push(DrawCommand::DrawPolyAt(
             turtle.turtle_shape.shape.clone(),
             pos,
             angle,
         ));
+        turtle.cmds.len() - 1
     }
 
-    fn get_turtle_shape_name(&mut self, turtle_id: TurtleID) -> String {
-        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
+    fn clear_stamp(&mut self, turtle: TurtleID, stamp: usize) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
+        assert!(matches!(
+            turtle.cmds[stamp],
+            DrawCommand::DrawPolyAt(_, _, _)
+        ));
+        turtle.cmds[stamp] = DrawCommand::Filler;
+        turtle.has_new_cmd = true;
+    }
+
+    fn clear_stamps(&mut self, turtle: TurtleID, count: StampCount) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
+        let all = turtle.cmds.len();
+        let (mut iter, mut count) = match count {
+            StampCount::Forward(count) => (Either::Right(turtle.cmds.iter_mut()), count),
+            StampCount::Reverse(count) => (Either::Left(turtle.cmds.iter_mut().rev()), count),
+            StampCount::All => (Either::Right(turtle.cmds.iter_mut()), all),
+        };
+
+        while count > 0 {
+            if let Some(cmd) = iter.next() {
+                if matches!(cmd, DrawCommand::DrawPolyAt(_, _, _)) {
+                    count -= 1;
+                    *cmd = DrawCommand::Filler
+                }
+            } else {
+                break;
+            }
+        }
+
+        turtle.has_new_cmd = true;
+    }
+
+    fn get_turtle_shape_name(&mut self, turtle: TurtleID) -> String {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
         turtle.turtle_shape.name.clone()
     }
 
-    fn append_command(&mut self, turtle_id: TurtleID, cmd: DrawCommand) {
-        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
+    fn append_command(&mut self, turtle: TurtleID, cmd: DrawCommand) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
         turtle.cmds.push(cmd);
         turtle.has_new_cmd = true;
     }
 
-    fn get_position(&self, turtle_id: TurtleID) -> usize {
-        self.turtle[&turtle_id].cmds.len()
+    fn get_position(&self, turtle: TurtleID) -> usize {
+        self.turtle[&turtle].cmds.len()
     }
 
-    fn fill_polygon(&mut self, turtle_id: TurtleID, cmd: DrawCommand, index: usize) {
-        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
+    fn fill_polygon(&mut self, turtle: TurtleID, cmd: DrawCommand, index: usize) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
         turtle.has_new_cmd = true;
         turtle.cmds[index] = cmd;
+        turtle.cmds.push(DrawCommand::Filled(index));
     }
 
-    fn undo_count(&self, turtle_id: TurtleID) -> usize {
-        self.turtle
-            .get(&turtle_id)
-            .expect("missing turtle")
-            .cmds
-            .len()
+    fn undo_count(&self, turtle: TurtleID) -> usize {
+        self.turtle.get(&turtle).expect("missing turtle").cmds.len()
     }
 
-    fn undo(&mut self, turtle_id: TurtleID) {
-        let turtle = self.turtle.get_mut(&turtle_id).expect("missing turtle");
-        turtle.cmds.pop();
+    fn undo(&mut self, turtle: TurtleID) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
         turtle.has_new_cmd = true;
+    }
+
+    fn pop(&mut self, turtle: TurtleID) -> Option<DrawCommand> {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
+        let cmd = turtle.cmds.pop();
+
+        if let Some(DrawCommand::Filled(index)) = &cmd {
+            turtle.cmds[*index] = DrawCommand::Filler;
+        }
+
+        cmd
     }
 
     fn numinput(&mut self, turtle: TurtleID, thread: TurtleThread, title: &str, prompt: &str) {
@@ -319,7 +368,25 @@ impl TurtleGui for IcedGuiInternal {
     }
 
     fn bgcolor(&mut self, color: TurtleColor) {
-        self.newbgcolor = Some(color);
+        self.bgcolor = color;
+    }
+
+    fn resize(&mut self, turtle: TurtleID, thread: TurtleThread, width: isize, height: isize) {
+        let new_size = Size::new(width as f32, height as f32);
+        self.wcmds
+            .push(window::resize::<Message>(window::Id::MAIN, new_size));
+        self.resize_request = Some((turtle, thread));
+    }
+
+    fn set_visible(&mut self, turtle: TurtleID, visible: bool) {
+        let turtle = self.turtle.get_mut(&turtle).expect("missing turtle");
+        turtle.hide_turtle = !visible;
+        turtle.has_new_cmd = true;
+    }
+
+    fn is_visible(&self, turtle: TurtleID) -> bool {
+        let turtle = self.turtle.get(&turtle).expect("missing turtle");
+        !turtle.hide_turtle
     }
 }
 
@@ -338,10 +405,12 @@ impl Application for IcedGuiFramework {
 
         let framework = Self {
             cache: Cache::default(),
-            bgcolor: TurtleColor::from("white"),
             tt,
             clear_cache: true,
             gui: IcedGuiInternal::new(WindowID::MAIN, PopupData::mainwin(&title)),
+            winsize: (0., 0.),
+            mouse_pos: (0., 0.),
+            mouse_down: false,
         };
 
         (framework, IcedCommand::none())
@@ -373,8 +442,50 @@ impl Application for IcedGuiFramework {
             }
             Message::Event(event) => {
                 let turtle_event: TurtleEvent = event.into();
-                if !matches!(turtle_event, TurtleEvent::Unhandled) {
-                    self.tt.handle_event(turtle_event);
+                match &turtle_event {
+                    TurtleEvent::WindowResize(x, y) => {
+                        self.winsize = (*x as f32, *y as f32);
+                        if self.gui.resize_request.is_none() {
+                            self.tt.handle_event(None, None, turtle_event);
+                        } else {
+                            let (turtle, thread) =
+                                self.gui.resize_request.expect("missing resize data");
+                            self.tt
+                                .handle_event(Some(turtle), Some(thread), turtle_event);
+                        }
+                    }
+                    TurtleEvent::MousePosition(x, y) => {
+                        self.mouse_pos = self.to_turtle_pos(x, y);
+                        if self.mouse_down {
+                            self.tt.handle_event(
+                                None,
+                                None,
+                                TurtleEvent::MouseDrag(self.mouse_pos.0, self.mouse_pos.1),
+                            );
+                        }
+                    }
+                    TurtleEvent::MouseDrag(_, _) => unimplemented!(),
+                    TurtleEvent::MousePress(_x, _y) => {
+                        self.mouse_down = true;
+                        self.tt.handle_event(
+                            None,
+                            None,
+                            TurtleEvent::MousePress(self.mouse_pos.0, self.mouse_pos.1),
+                        );
+                    }
+                    TurtleEvent::MouseRelease(_x, _y) => {
+                        self.mouse_down = false;
+                        self.tt.handle_event(
+                            None,
+                            None,
+                            TurtleEvent::MouseRelease(self.mouse_pos.0, self.mouse_pos.1),
+                        );
+                    }
+                    TurtleEvent::Unhandled => {}
+                    TurtleEvent::KeyPress(_) | TurtleEvent::KeyRelease(_) => {
+                        self.tt.handle_event(None, None, turtle_event);
+                    }
+                    TurtleEvent::_Timer => todo!(),
                 }
             }
             Message::TextInputChanged(id, msg) => {
@@ -497,7 +608,7 @@ impl<Message> canvas::Program<Message> for IcedGuiFramework {
                 [0., 0.].into(),
                 bounds.size(),
                 Fill {
-                    style: stroke::Style::Solid((&self.bgcolor).into()),
+                    style: stroke::Style::Solid((&self.gui.bgcolor).into()),
                     rule: Rule::NonZero,
                 },
             );
@@ -528,25 +639,26 @@ impl IcedGuiFramework {
 
     // returns true if the cache should be cleared
     fn update_turtles(&mut self) -> bool {
-        if let Some(color) = self.gui.newbgcolor.take() {
-            self.bgcolor = color;
-        }
-
         let mut done = true;
 
         for (tid, turtle) in self.gui.turtle.iter_mut() {
             let (pct, prog) = self.tt.progress(*tid);
             if turtle.has_new_cmd {
+                done = false;
                 turtle.convert(pct);
                 if prog.is_done(pct) {
                     turtle.has_new_cmd = false;
-                } else {
-                    done = false;
                 }
             }
         }
 
         !done
+    }
+
+    fn to_turtle_pos(&self, x: &f32, y: &f32) -> (f32, f32) {
+        let x = *x;
+        let y = *y;
+        (x - self.winsize.0 / 2., -(y - self.winsize.1 / 2.))
     }
 }
 
@@ -554,6 +666,7 @@ impl IcedGuiInternal {
     fn new(window_id: WindowID, popup_data: PopupData) -> Self {
         let mut this = Self {
             popups: HashMap::from([(window_id, popup_data)]),
+            bgcolor: TurtleColor::from("white"),
             ..Self::default()
         };
         let _turtle = this.new_turtle();
@@ -573,8 +686,27 @@ impl IcedGuiInternal {
 }
 
 impl From<Event> for TurtleEvent {
-    fn from(value: Event) -> Self {
-        match value {
+    fn from(event: Event) -> Self {
+        fn convert_mouse_event(event: mouse::Event) -> TurtleEvent {
+            match event {
+                mouse::Event::CursorMoved { position } => {
+                    TurtleEvent::MousePosition(position.x, position.y)
+                }
+                mouse::Event::ButtonPressed(_) => TurtleEvent::MousePress(0., 0.),
+                mouse::Event::ButtonReleased(_) => TurtleEvent::MouseRelease(0., 0.),
+                _ => TurtleEvent::Unhandled,
+            }
+        }
+
+        match event {
+            Event::Keyboard(KeyReleased { key, .. }) => {
+                if let Key::Character(s) = key.as_ref() {
+                    let ch = s.chars().next().unwrap();
+                    TurtleEvent::KeyRelease(ch)
+                } else {
+                    TurtleEvent::Unhandled
+                }
+            }
             Event::Keyboard(KeyPressed { key, .. }) => {
                 if let Key::Character(s) = key.as_ref() {
                     let ch = s.chars().next().unwrap();
@@ -586,7 +718,7 @@ impl From<Event> for TurtleEvent {
             Event::Window(window::Id::MAIN, Resized { width, height }) => {
                 TurtleEvent::WindowResize(width, height)
             }
-            Event::Mouse(_) => TurtleEvent::Unhandled,
+            Event::Mouse(mouse_event) => convert_mouse_event(mouse_event),
             Event::Touch(_) => TurtleEvent::Unhandled,
             _ => TurtleEvent::Unhandled,
         }

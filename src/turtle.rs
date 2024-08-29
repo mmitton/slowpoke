@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    gui::{events::TurtleEvent, iced_gui::IcedGuiFramework, Progression},
+    gui::{events::TurtleEvent, iced_gui::IcedGuiFramework, Progression, StampCount},
     turtle::types::TurtleID,
 };
 
@@ -21,10 +21,11 @@ use crate::{
     command::{
         Command, DataCmd, DrawRequest, InputCmd, InstantaneousDrawCmd, ScreenCmd, TimedDrawCmd,
     },
+    comms::{Request, Response},
     generate::{CurrentTurtleState, DrawCommand, TurtlePosition},
     polygon::{generate_default_shapes, TurtlePolygon, TurtleShape},
     speed::TurtleSpeed,
-    Request, Response, ScreenPosition, TurtleShapeName,
+    ScreenPosition, TurtleShapeName,
 };
 
 #[derive(Debug)]
@@ -70,11 +71,6 @@ pub struct Turtle {
     turtle: TurtleID,
     thread: TurtleThread,
     tracer: RefCell<bool>,
-}
-
-enum ClearDirection {
-    Forward,
-    Reverse,
 }
 
 impl Turtle {
@@ -155,7 +151,7 @@ impl Turtle {
 
     fn do_command(&self, cmd: Command) -> Response {
         let is_data_cmd = matches!(cmd, Command::Data(_));
-        let tracer_was_off = *self.tracer.borrow();
+        let tracer_was_off = !*self.tracer.borrow();
         if let Command::Draw(DrawRequest::InstantaneousDraw(InstantaneousDrawCmd::Tracer(t))) = &cmd
         {
             *self.tracer.borrow_mut() = *t;
@@ -185,7 +181,6 @@ impl Turtle {
                         if matches!(result, Response::Done) {
                             continue;
                         } else {
-                            println!("Got response: {result:?}");
                             return result;
                         }
                     }
@@ -245,10 +240,11 @@ impl PolygonBuilder {
 
 #[derive(Default)]
 pub(crate) struct TurtleInternalData {
-    queue: VecDeque<TurtleCommand>,       // new elements to draw
+    queue: VecDeque<TurtleCommand>, // new commands to draw
+
     current_command: Option<DrawRequest>, // what we're drawing now
-    elements: Vec<DrawCommand>,
     current_shape: CurrentTurtleState,
+    current_stamp: usize,
 
     current_turtle: TurtleID,
     current_thread: TurtleThread,
@@ -258,14 +254,31 @@ pub(crate) struct TurtleInternalData {
     insert_fill: Option<usize>,
     responder: HashMap<TurtleThread, Sender<Response>>,
     onkeypress: HashMap<char, fn(&mut Turtle, char)>,
+    onkeyrelease: HashMap<char, fn(&mut Turtle, char)>,
+    onmousepress: Option<fn(&mut Turtle, x: f32, y: f32)>,
+    onmouserelease: Option<fn(&mut Turtle, x: f32, y: f32)>,
+    onmousedrag: Option<fn(&mut Turtle, x: f32, y: f32)>,
     drawing_done: bool,
-    turtle_invisible: bool,
     tracer: bool,
     respond_immediately: bool,
     speed: TurtleSpeed,
-    // turtle_shape: TurtleShape,
+    next_thread: TurtleThread,
+
     fill_poly: PolygonBuilder,
     shape_poly: PolygonBuilder,
+
+    pending_keys: bool,
+}
+
+impl TurtleInternalData {
+    fn pending_key_event(&mut self) -> bool {
+        if self.pending_keys {
+            true
+        } else {
+            self.pending_keys = true;
+            false
+        }
+    }
 }
 
 use crate::gui::TurtleGui;
@@ -300,7 +313,6 @@ impl TurtleData {
                     self.data.fill_poly.update(lineinfo.end);
                     self.data.shape_poly.update(lineinfo.end);
                     gui.append_command(tid, command);
-                    // self.data.elements.push(command);
                 }
                 DrawCommand::Circle(circle) => {
                     for c in circle {
@@ -313,7 +325,7 @@ impl TurtleData {
                     panic!("oops");
                 }
                 DrawCommand::StampTurtle => {
-                    gui.stamp(
+                    self.data.current_stamp = gui.stamp(
                         tid,
                         self.data.current_shape.pos(),
                         self.data.current_shape.angle,
@@ -391,9 +403,8 @@ impl TurtleData {
             self.data.drawing_done = false;
 
             if matches!(self.data.progression, Progression::Reverse) {
-                gui.undo(self.data.current_turtle);
-                if let Some(element) = self.data.elements.pop() {
-                    match element {
+                if let Some(cmd) = gui.pop(self.data.current_turtle) {
+                    match cmd {
                         DrawCommand::Line(line) => {
                             let x = line.begin.x as f32;
                             let y = line.begin.y as f32;
@@ -440,6 +451,7 @@ impl TurtleData {
             if matches!(cmd, DrawRequest::TimedDraw(TimedDrawCmd::Undo)) {
                 self.data.progression = Progression::Reverse;
                 self.data.percent = 1.;
+                gui.undo(turtle);
             } else {
                 self.data.progression = Progression::Forward;
                 self.data.percent = 0.;
@@ -451,7 +463,7 @@ impl TurtleData {
 
     fn send_response(&mut self, thread: TurtleThread, is_stamp: bool) {
         let _ = self.data.responder[&thread].send(if is_stamp {
-            Response::StampID(self.data.elements.len() - 1)
+            Response::StampID(self.data.current_stamp)
         } else {
             Response::Done
         });
@@ -509,30 +521,82 @@ impl TurtleTask {
         let _ = self.data[turtle].data.responder[&thread].send(Response::Cancel);
     }
 
-    pub(crate) fn handle_event(&mut self, event: TurtleEvent) {
+    pub(crate) fn handle_event(
+        &mut self,
+        turtle: Option<TurtleID>,
+        thread: Option<TurtleThread>,
+        event: TurtleEvent,
+    ) {
+        use TurtleEvent::*;
+
         let mut work = Vec::new();
 
         match event {
-            TurtleEvent::WindowResize(width, height) => {
+            WindowResize(width, height) => {
                 self.winsize = [width as isize, height as isize];
+                if turtle.is_none() {
+                    assert!(thread.is_none());
+                } else {
+                    let turtle = turtle.expect("missing turtle from window resize");
+                    let thread = thread.expect("missing thread from window resize");
+                    let _ = self.data[turtle].data.responder[&thread].send(Response::Done);
+                }
             }
-            TurtleEvent::KeyPress(ch) => {
-                for (idx, turtle) in self.data.iter().enumerate() {
+            KeyPress(ch) => {
+                for (idx, turtle) in self.data.iter_mut().enumerate() {
                     if let Some(func) = turtle.data.onkeypress.get(&ch).copied() {
-                        work.push((TurtleID::new(idx), func, ch));
+                        if !turtle.data.pending_key_event() {
+                            work.push((TurtleID::new(idx), Either::Right((func, ch))));
+                        }
                     }
                 }
             }
-            TurtleEvent::KeyRelease(_) => todo!(),
-            TurtleEvent::MousePress(_, _, _) => todo!(),
-            TurtleEvent::Timer => todo!(),
-            TurtleEvent::Unhandled => {}
+            KeyRelease(ch) => {
+                for (idx, turtle) in self.data.iter_mut().enumerate() {
+                    if let Some(func) = turtle.data.onkeyrelease.get(&ch).copied() {
+                        if !turtle.data.pending_key_event() {
+                            work.push((TurtleID::new(idx), Either::Right((func, ch))));
+                        }
+                    }
+                }
+            }
+            MousePress(x, y) => {
+                for (idx, turtle) in self.data.iter().enumerate() {
+                    if let Some(func) = turtle.data.onmousepress {
+                        work.push((TurtleID::new(idx), Either::Left((func, x, y))));
+                    }
+                }
+            }
+            MouseRelease(x, y) => {
+                for (idx, turtle) in self.data.iter().enumerate() {
+                    if let Some(func) = turtle.data.onmouserelease {
+                        work.push((TurtleID::new(idx), Either::Left((func, x, y))));
+                    }
+                }
+            }
+            MousePosition(_, _) => todo!(),
+            MouseDrag(x, y) => {
+                for (idx, turtle) in self.data.iter().enumerate() {
+                    if let Some(func) = turtle.data.onmousedrag {
+                        work.push((TurtleID::new(idx), Either::Left((func, x, y))));
+                    }
+                }
+            }
+            _Timer => todo!(),
+            Unhandled => {}
         }
 
-        for (idx, func, key) in work {
-            let tid = TurtleThread::new(self.data[idx].data.responder.len());
+        for (idx, job) in work {
+            let tid = self.data[idx].data.next_thread.get();
             let mut new_turtle = self.spawn_turtle(idx, tid);
-            let _ = std::thread::spawn(move || func(&mut new_turtle, key));
+
+            let _ = std::thread::spawn(move || {
+                match job {
+                    Either::Left((func, x, y)) => func(&mut new_turtle, x, y),
+                    Either::Right((func, key)) => func(&mut new_turtle, key),
+                }
+                let _ = new_turtle.issue_command.send(Request::shut_down(idx, tid));
+            });
         }
     }
 
@@ -595,15 +659,11 @@ impl TurtleTask {
             .clone();
         match cmd {
             ScreenCmd::SetSize(s) => {
-                /* TODO: move to gui
-                self.wcmds
-                    .push(window::resize::<Message>(window::Id::MAIN, s));
-                */
-                self.winsize = s; // TODO: wait until resize is complete before saving
-                let _ = resp.send(Response::Done); // TODO: don't respond until resize event
+                gui.resize(turtle, thread, s[0], s[1]);
+                // Note: don't send "done" here -- wait for the resize event from the GUI
             }
             ScreenCmd::ShowTurtle(t) => {
-                self.data[turtle].data.turtle_invisible = !t;
+                gui.set_visible(turtle, t);
                 let _ = resp.send(Response::Done);
             }
             ScreenCmd::Speed(s) => {
@@ -618,51 +678,23 @@ impl TurtleTask {
                 let _ = resp.send(Response::Done);
             }
             ScreenCmd::ClearScreen => {
-                self.data[turtle].data.elements.clear();
                 self.bgcolor = TurtleColor::from("black");
                 let _ = resp.send(Response::Done);
             }
             ScreenCmd::ClearStamp(id) => {
-                if id < self.data[turtle].data.elements.len()
-                    && matches!(
-                        self.data[turtle].data.elements[id],
-                        DrawCommand::DrawPolyAt(..)
-                    )
-                {
-                    self.data[turtle].data.elements[id] = DrawCommand::Filler;
-                }
+                gui.clear_stamp(turtle, id);
                 let _ = resp.send(Response::Done);
             }
             ScreenCmd::ClearStamps(count) => {
                 #[allow(clippy::comparison_chain)]
                 if count < 0 {
-                    self.clear_stamps(turtle, -count, ClearDirection::Reverse);
+                    gui.clear_stamps(turtle, StampCount::Reverse((-count) as usize));
                 } else if count == 0 {
-                    self.clear_stamps(turtle, isize::MAX, ClearDirection::Forward);
+                    gui.clear_stamps(turtle, StampCount::All);
                 } else {
-                    self.clear_stamps(turtle, count, ClearDirection::Forward);
+                    gui.clear_stamps(turtle, StampCount::Forward(count as usize));
                 }
                 let _ = resp.send(Response::Done);
-            }
-        }
-    }
-
-    fn clear_stamps(&mut self, turtle: TurtleID, mut count: isize, dir: ClearDirection) {
-        let mut iter = match dir {
-            ClearDirection::Forward => Either::Right(self.data[turtle].data.elements.iter_mut()),
-            ClearDirection::Reverse => {
-                Either::Left(self.data[turtle].data.elements.iter_mut().rev())
-            }
-        };
-
-        while count > 0 {
-            if let Some(cmd) = iter.next() {
-                if cmd.is_stamp() {
-                    count -= 1;
-                    *cmd = DrawCommand::Filler
-                }
-            } else {
-                break;
             }
         }
     }
@@ -675,8 +707,24 @@ impl TurtleTask {
             .unwrap()
             .clone();
         match cmd {
-            InputCmd::OnKeyPress(f, k) => {
+            InputCmd::KeyRelease(f, k) => {
+                self.data[turtle].data.onkeyrelease.insert(k, f);
+                let _ = resp.send(Response::Done);
+            }
+            InputCmd::KeyPress(f, k) => {
                 self.data[turtle].data.onkeypress.insert(k, f);
+                let _ = resp.send(Response::Done);
+            }
+            InputCmd::MouseDrag(f) => {
+                self.data[turtle].data.onmousedrag = Some(f);
+                let _ = resp.send(Response::Done);
+            }
+            InputCmd::MousePress(f) => {
+                self.data[turtle].data.onmousepress = Some(f);
+                let _ = resp.send(Response::Done);
+            }
+            InputCmd::MouseRelease(f) => {
+                self.data[turtle].data.onmouserelease = Some(f);
                 let _ = resp.send(Response::Done);
             }
         }
@@ -695,11 +743,10 @@ impl TurtleTask {
             .get(&thread)
             .unwrap()
             .clone();
+
         let _ = match &cmd {
             DataCmd::GetScreenSize => resp.send(Response::ScreenSize(self.winsize)),
-            DataCmd::Visibility => resp.send(Response::Visibility(
-                !self.data[turtle].data.turtle_invisible,
-            )),
+            DataCmd::Visibility => resp.send(Response::Visibility(gui.is_visible(turtle))),
             DataCmd::GetPoly => resp.send(Response::Polygon(
                 self.data[turtle].data.shape_poly.verticies.clone(),
             )),
@@ -763,6 +810,11 @@ impl TurtleTask {
         let thread = req.thread;
 
         match req.cmd {
+            Command::ShutDown => {
+                let tid = self.data[turtle].data.responder.remove(&thread);
+                self.data[turtle].data.pending_keys = false;
+                assert!(tid.is_some());
+            }
             Command::Screen(cmd) => self.screen_cmd(turtle, cmd, thread, gui),
             Command::Draw(cmd) => self.draw_cmd(turtle, cmd, thread),
             Command::Input(cmd) => self.input_cmd(turtle, cmd, thread),

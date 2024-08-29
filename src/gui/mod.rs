@@ -16,7 +16,13 @@ pub(crate) trait TurtleGui: Default + Sized {
     fn set_shape(&mut self, turtle: TurtleID, shape: TurtleShape);
 
     // stamp the turtle's shape onto the canvas
-    fn stamp(&mut self, turtle: TurtleID, pos: ScreenPosition<f32>, angle: f32);
+    fn stamp(&mut self, turtle: TurtleID, pos: ScreenPosition<f32>, angle: f32) -> usize;
+
+    // clear a given stamp id
+    fn clear_stamp(&mut self, turtle: TurtleID, stamp: usize);
+
+    // clear the first/last quantity of stamps
+    fn clear_stamps(&mut self, turtle: TurtleID, count: StampCount);
 
     // get the name of the current turtle's shape
     fn get_turtle_shape_name(&mut self, turtle_id: TurtleID) -> String;
@@ -31,8 +37,11 @@ pub(crate) trait TurtleGui: Default + Sized {
     // backfill a polygon at a given position
     fn fill_polygon(&mut self, turtle: TurtleID, cmd: DrawCommand, index: usize);
 
-    // undo last command
+    // start the 'undo' drawing process
     fn undo(&mut self, turtle: TurtleID);
+
+    // remove last command and start to undo the next
+    fn pop(&mut self, turtle: TurtleID) -> Option<DrawCommand>;
 
     // how many commands can be undone
     fn undo_count(&self, turtle: TurtleID) -> usize;
@@ -45,9 +54,18 @@ pub(crate) trait TurtleGui: Default + Sized {
 
     // set the background color
     fn bgcolor(&mut self, color: TurtleColor);
+
+    // resize the window
+    fn resize(&mut self, turtle: TurtleID, thread: TurtleThread, width: isize, height: isize);
+
+    // show or hide the turtle
+    fn set_visible(&mut self, turtle: TurtleID, visible: bool);
+
+    // get the current visibility status
+    fn is_visible(&self, turtle: TurtleID) -> bool;
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub(crate) enum Progression {
     #[default]
     Forward,
@@ -62,4 +80,10 @@ impl Progression {
             _ => false,
         }
     }
+}
+
+pub(crate) enum StampCount {
+    Forward(usize), // delete from the beginning of the stamp list
+    Reverse(usize), // delete from the end of the stamp list
+    All,
 }

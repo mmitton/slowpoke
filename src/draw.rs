@@ -6,10 +6,11 @@ use crate::{
     command::{
         DataCmd, DrawRequest, InstantaneousDrawCmd, MotionCmd, RotateCmd, ScreenCmd, TimedDrawCmd,
     },
+    comms::Response,
     polygon::TurtleShapeName,
     speed::TurtleSpeed,
     turtle::Turtle,
-    Response, ScreenPosition, StampID,
+    ScreenPosition, StampID,
 };
 
 impl Turtle {
@@ -319,10 +320,11 @@ impl Turtle {
     }
 
     pub fn getscreensize(&self) -> [isize; 2] {
-        if let Response::ScreenSize(size) = self.do_data(DataCmd::GetScreenSize) {
+        let response = self.do_data(DataCmd::GetScreenSize);
+        if let Response::ScreenSize(size) = response {
             size
         } else {
-            panic!("invalid response from turtle");
+            panic!("{}", format!("invalid response from turtle: {response:?}"));
         }
     }
 

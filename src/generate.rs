@@ -36,6 +36,7 @@ impl CirclePos {
 #[derive(Debug, Clone)]
 pub(crate) enum DrawCommand {
     Filler,
+    Filled(usize),
     BeginFill,
     EndFill,
     BeginPoly,
@@ -50,12 +51,6 @@ pub(crate) enum DrawCommand {
     DrawDot(Point2D<f32>, f32, TurtleColor), // center, radius, color
     DrawPolyAt(TurtlePolygon, ScreenPosition<f32>, f32), // poly, pos, angle
     Circle(Vec<CirclePos>),
-}
-
-impl DrawCommand {
-    pub(crate) fn is_stamp(&self) -> bool {
-        matches!(self, Self::DrawPolyAt(..))
-    }
 }
 
 #[derive(Debug)]
